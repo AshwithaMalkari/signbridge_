@@ -1,3 +1,4 @@
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -5,6 +6,12 @@ ENV PYTHONUNBUFFERED=1
 ENV NLTK_DATA=/usr/local/share/nltk_data
 
 WORKDIR /app
+
+# Install Linux libraries required by OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
