@@ -88,42 +88,21 @@ download_nltk_resources()
 # SPACY
 # ============================================================
 
-# try:
+try:
 
-#     nlp = spacy.load(
-#         "en_core_web_sm"
-#     )
+    nlp = spacy.load(
+        "en_core_web_sm"
+    )
 
-# except Exception as e:
+except Exception as e:
 
-#     logger.error(
-#         "Error loading spaCy model. "
-#         "Run 'python -m spacy download en_core_web_sm' "
-#         "to download the model."
-#     )
+    logger.error(
+        "Error loading spaCy model. "
+        "Run 'python -m spacy download en_core_web_sm' "
+        "to download the model."
+    )
 
-#     raise e
-
-nlp = None
-
-
-def get_nlp():
-    global nlp
-
-    if nlp is None:
-        try:
-            logger.info("Loading spaCy model on demand...")
-            nlp = spacy.load("en_core_web_sm")
-            logger.info("spaCy model loaded successfully.")
-        except Exception as e:
-            logger.error(
-                "Error loading spaCy model. "
-                "Run 'python -m spacy download en_core_web_sm' "
-                "to download the model."
-            )
-            raise e
-
-    return nlp
+    raise e
 
 
 # ============================================================
@@ -890,7 +869,7 @@ def extract_isl_structure_spacy(text):
     directional words.
     """
 
-    doc = get_nlp()(text)
+    doc = nlp(text)
 
     important_words = []
 
