@@ -1,3 +1,5 @@
+import base64
+import numpy as np
 from flask import Flask, request, jsonify, render_template, Response
 from flask_cors import CORS
 import nltk
@@ -133,13 +135,13 @@ sign_recognizer = ISLSignRecognizer()
 
 logger.info("LIVE ISL SIGN RECOGNIZER READY")
 
-
 # ============================================================
 # SIGN WEBCAM STATE
 # ============================================================
 
 camera = None
 camera_lock = threading.Lock()
+recognition_lock = threading.Lock()
 camera_running = False
 
 last_sign_result = {
@@ -155,78 +157,103 @@ last_sign_result = {
 }
 
 
-# ============================================================
-# SIGN CAMERA FUNCTIONS
-# ============================================================
-
-def open_camera():
-    global camera
-    global camera_running
-
-    with camera_lock:
-        if camera is not None and camera.isOpened():
-            camera_running = True
-            return True
-
-        logger.info("Opening webcam...")
-
-        camera = cv2.VideoCapture(0)
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        if not camera.isOpened():
-            logger.error("Could not open webcam")
-            camera = None
-            camera_running = False
-            return False
-
-        camera_running = True
-        sign_recognizer.reset()
-
-        logger.info("Webcam opened successfully")
-        return True
-
-
-def close_camera():
-    global camera
-    global camera_running
-
-    with camera_lock:
-        camera_running = False
-
-        if camera is not None:
-            try:
-                camera.release()
-            except Exception:
-                pass
-            camera = None
-
-        sign_recognizer.reset()
-        logger.info("Webcam closed")
-
-
-def generate_sign_frames():
-    global camera
-    global camera_running
+def reset_sign_result():
     global last_sign_result
 
-    if not open_camera():
-        return
+    last_sign_result = {
+        "prediction": "",
+        "confidence": 0.0,
+        "stable_prediction": "",
+        "hand_count": 0,
+        "model": "",
+        "v5_prediction": "",
+        "v5_confidence": 0.0,
+        "ds_prediction": "",
+        "ds_confidence": 0.0
+    }
 
-    while camera_running:
-        with camera_lock:
-            if camera is None or not camera.isOpened():
-                break
-            success, frame = camera.read()
 
-        if not success:
-            logger.warning("Failed to read webcam frame")
-            time.sleep(0.05)
-            continue
+# ============================================================
+# SIGN RECOGNITION API
+# ============================================================
 
-        try:
+@app.route("/sign_start", methods=["POST"])
+def sign_start():
+    global camera_running
+
+    try:
+        with recognition_lock:
+            sign_recognizer.reset()
+            reset_sign_result()
+
+        camera_running = True
+
+        return jsonify({
+            "error": False,
+            "message": "Sign recognition started"
+        }), 200
+
+    except Exception:
+        logger.exception("Error starting sign recognition")
+        camera_running = False
+
+        return jsonify({
+            "error": True,
+            "message": "Could not start sign recognition"
+        }), 500
+
+
+@app.route("/sign_frame", methods=["POST"])
+def sign_frame():
+    global last_sign_result
+
+    if not camera_running:
+        return jsonify({
+            "error": True,
+            "message": "Sign recognition is not running"
+        }), 409
+
+    try:
+        image_bytes = request.get_data(cache=False)
+
+        if not image_bytes:
+            return jsonify({
+                "error": True,
+                "message": "No webcam frame received"
+            }), 400
+
+        encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            return jsonify({
+                "error": True,
+                "message": "Could not decode webcam frame"
+            }), 400
+
+        # Keep the existing recognizer and preprocessing unchanged.
+        with recognition_lock:
+            if not camera_running:
+                return jsonify({
+                    "error": True,
+                    "message": "Sign recognition has stopped"
+                }), 409
+
             result = sign_recognizer.process_frame(frame)
+
             annotated_frame = result["frame"]
+
+            success, buffer = cv2.imencode(
+                ".jpg",
+                annotated_frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+            )
+
+            if not success:
+                return jsonify({
+                    "error": True,
+                    "message": "Could not encode processed frame"
+                }), 500
 
             last_sign_result = {
                 "prediction": result.get("prediction", "") or "",
@@ -240,69 +267,46 @@ def generate_sign_frames():
                 "ds_confidence": float(result.get("ds_confidence", 0.0))
             }
 
-            success, buffer = cv2.imencode(".jpg", annotated_frame)
-            if not success:
-                continue
+            annotated_image = base64.b64encode(
+                buffer.tobytes()
+            ).decode("ascii")
 
-            frame_bytes = buffer.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + frame_bytes
-                + b"\r\n"
-            )
-
-        except Exception as e:
-            logger.error(f"Error processing sign frame: {e}")
-            time.sleep(0.05)
-
-
-# ============================================================
-# SIGN RECOGNITION API
-# ============================================================
-
-@app.route("/sign_video")
-def sign_video():
-    return Response(
-        generate_sign_frames(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
-
-
-@app.route("/sign_start", methods=["POST"])
-def sign_start():
-    try:
-        success = open_camera()
-        if not success:
-            return jsonify({
-                "error": True,
-                "message": "Could not open webcam"
-            }), 500
+            response_data = dict(last_sign_result)
 
         return jsonify({
             "error": False,
-            "message": "Sign recognition started"
+            **response_data,
+            "annotated_frame": annotated_image
         }), 200
 
-    except Exception as e:
-        logger.error(f"Error starting sign recognition: {e}")
+    except Exception:
+        logger.exception("Error processing browser webcam frame")
+
         return jsonify({
             "error": True,
-            "message": "Could not start sign recognition"
+            "message": "Could not process webcam frame"
         }), 500
 
 
 @app.route("/sign_stop", methods=["POST"])
 def sign_stop():
+    global camera_running
+
+    camera_running = False
+
     try:
-        close_camera()
+        with recognition_lock:
+            sign_recognizer.reset()
+            reset_sign_result()
+
         return jsonify({
             "error": False,
             "message": "Sign recognition stopped"
         }), 200
 
-    except Exception as e:
-        logger.error(f"Error stopping sign recognition: {e}")
+    except Exception:
+        logger.exception("Error stopping sign recognition")
+
         return jsonify({
             "error": True,
             "message": "Could not stop sign recognition"
@@ -320,21 +324,9 @@ def sign_state():
 
 @app.route("/sign_clear", methods=["POST"])
 def sign_clear():
-    global last_sign_result
-
-    sign_recognizer.reset()
-
-    last_sign_result = {
-        "prediction": "",
-        "confidence": 0.0,
-        "stable_prediction": "",
-        "hand_count": 0,
-        "model": "",
-        "v5_prediction": "",
-        "v5_confidence": 0.0,
-        "ds_prediction": "",
-        "ds_confidence": 0.0
-    }
+    with recognition_lock:
+        sign_recognizer.reset()
+        reset_sign_result()
 
     return jsonify({
         "error": False,
@@ -342,22 +334,7 @@ def sign_clear():
     }), 200
 
 
-# ============================================================
-# LIVE LETTER RECOGNITION
-#
-# The webcam recognition program will POST a stable
-# recognized letter here.
-#
-# Example:
-#
-# {
-#     "letter": "A",
-#     "confidence": 0.87
-# }
-#
-# The browser can then GET /api/letter
-# to retrieve the latest recognized letter.
-# ============================================================
+
 
 latest_letter = {
     "letter": "",

@@ -551,6 +551,19 @@
 
                 <div class="sign-camera-wrapper">
 
+                  <video
+                    id="signCameraSource"
+                    autoplay
+                    playsinline
+                    muted
+                    style="display:none;">
+                  </video>
+
+                  <canvas
+                    id="signFrameCanvas"
+                    style="display:none;">
+                  </canvas>
+
                   <img
                     id="signVideo"
                     src=""
@@ -977,6 +990,16 @@ document.addEventListener("DOMContentLoaded", function () {
 
     const signVideo =
         document.getElementById("signVideo");
+    const signCameraSource =
+        document.getElementById("signCameraSource");
+
+    const signFrameCanvas =
+        document.getElementById("signFrameCanvas");
+
+    const signFrameContext =
+        signFrameCanvas.getContext("2d");
+
+    let cameraStream = null;
 
     const signCameraPlaceholder =
         document.getElementById("signCameraPlaceholder");
@@ -1223,106 +1246,150 @@ document.addEventListener("DOMContentLoaded", function () {
 
         });
 
+    
+    // ====================================================
+    // SEND BROWSER CAMERA FRAMES TO FLASK
+    // ====================================================
+
+    async function sendSignFrames() {
+        while (signRunning && cameraStream) {
+            try {
+                if (
+                    signCameraSource.readyState < 2 ||
+                    !signCameraSource.videoWidth ||
+                    !signCameraSource.videoHeight
+                ) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    continue;
+                }
+
+                signFrameCanvas.width = signCameraSource.videoWidth;
+                signFrameCanvas.height = signCameraSource.videoHeight;
+
+                signFrameContext.drawImage(
+                    signCameraSource,
+                    0,
+                    0,
+                    signFrameCanvas.width,
+                    signFrameCanvas.height
+                );
+
+                const blob = await new Promise(resolve => {
+                    signFrameCanvas.toBlob(resolve, "image/jpeg", 0.85);
+                });
+
+                if (!blob) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    continue;
+                }
+
+                const response = await fetch("/sign_frame", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "image/jpeg"
+                    },
+                    body: blob
+                });
+
+                const data = await response.json();
+
+                if (!response.ok || data.error) {
+                    throw new Error(
+                        data.message || `Frame request failed: ${response.status}`
+                    );
+                }
+
+                if (!signRunning) break;
+
+                if (data.annotated_frame) {
+                    signVideo.src =
+                        "data:image/jpeg;base64," + data.annotated_frame;
+                }
+
+                // Keep the existing recognition and stability logic.
+                updateSignResult(data);
+
+            } catch (error) {
+                if (!signRunning) break;
+
+                console.error("Sign frame error:", error);
+                signStatusText.textContent = "Frame processing failed";
+                break;
+            }
+
+            // Wait before capturing the next frame.
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+    }
 
     // ====================================================
     // START SIGN RECOGNITION
     // ====================================================
 
+    
     if (startSignButton) {
-
-        startSignButton.addEventListener(
-            "click",
-            async function () {
-
-                try {
-
-                    const response =
-                        await fetch(
-                            "/sign_start",
-                            {
-                                method: "POST"
-                            }
-                        );
-
-
-                    const data =
-                        await response.json();
-
-
-                    if (data.error) {
-
-                        alert(
-                            data.message ||
-                            "Could not start webcam."
-                        );
-
-                        return;
-
-                    }
-
-
-                    signRunning = true;
-
-
-                    /*
-                     * Start completely fresh.
-                     */
-
-                    resetSignGate();
-
-
-                    signVideo.src =
-                        "/sign_video?time=" +
-                        Date.now();
-
-
-                    signVideo.style.display =
-                        "block";
-
-
-                    signCameraPlaceholder.style.display =
-                        "none";
-
-
-                    startSignButton.disabled =
-                        true;
-
-
-                    stopSignButton.disabled =
-                        false;
-
-
-                    signStatusText.textContent =
-                        "Sign recognition running";
-
-
-                    signStatusDot.classList.add(
-                        "active"
-                    );
-
-
-                    startSignPolling();
-
+        startSignButton.addEventListener("click", async function () {
+            try {
+                if (!navigator.mediaDevices?.getUserMedia) {
+                    throw new Error("Browser camera access is unavailable. Use HTTPS or localhost.");
                 }
 
-                catch (error) {
+                startSignButton.disabled = true;
+                signStatusText.textContent = "Requesting camera access...";
 
-                    console.error(
-                        "Sign start error:",
-                        error
-                    );
+                cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: "user",
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    },
+                    audio: false
+                });
 
+                signCameraSource.srcObject = cameraStream;
+                await signCameraSource.play();
 
-                    alert(
-                        "Could not start sign recognition."
-                    );
+                const response = await fetch("/sign_start", {
+                    method: "POST"
+                });
+                const data = await response.json();
 
+                if (!response.ok || data.error) {
+                    throw new Error(data.message || "Could not start sign recognition.");
                 }
 
+                signRunning = true;
+                resetSignGate();
+
+                signVideo.src = "";
+                signVideo.style.display = "block";
+                signCameraPlaceholder.style.display = "none";
+                stopSignButton.disabled = false;
+
+                signStatusText.textContent = "Sign recognition running";
+                signStatusDot.classList.add("active");
+
+                sendSignFrames();
+            } catch (error) {
+                console.error("Sign start error:", error);
+
+                signRunning = false;
+
+                if (cameraStream) {
+                    cameraStream.getTracks().forEach(track => track.stop());
+                    cameraStream = null;
+                }
+
+                signCameraSource.srcObject = null;
+                startSignButton.disabled = false;
+                stopSignButton.disabled = true;
+                signStatusText.textContent = "Camera could not start";
+
+                alert(error.message || "Could not start sign recognition.");
             }
-        );
-
+        });
     }
+
 
 
     // ====================================================
